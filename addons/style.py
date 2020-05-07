@@ -12,15 +12,12 @@
 
 from __future__ import print_function
 
-import cppcheckdata
-import itertools
 import sys
 import re
 import os
 import argparse
-import codecs
-import string
 import json
+import cppcheckdata
 
 
 class StyleChecker:
@@ -31,15 +28,15 @@ class StyleChecker:
             self.err_id = rule["errId"]
             self.err_msg = rule["errMsg"]
             self.severity = rule["severity"]
-        
+
         def reportError_fromToken(self, token, info = None):
             if info:
                 err_msg = self.err_msg + " " + str(info)
             else:
                 err_msg = self.err_msg
-            
+
             cppcheckdata.reportError(token, "style", err_msg, 'style', self.err_id, self.severity)
-        
+
         def reportError(self, file, line, column, info = None):
             token = cppcheckdata.Token
             token.file = file
@@ -58,8 +55,76 @@ class StyleChecker:
                 line_nr = 0
                 for line in file_content:
                     line_nr = line_nr + 1
-                    if self.parser.findall(line):
-                        super().reportError(file_name, line_nr, 0, self.parser.findall(line))
+                    for match in re.finditer(self.parser, line):
+                        super().reportError(file_name, line_nr, match.span()[0] + 1, match.group())
+
+    class LineLength(Checker):
+
+        def __init__(self, rule):
+            super().__init__(rule)
+            self.length = rule["args"]["length"]
+
+        def run(self, first_run, cfg, raw_tokens, file_name, file_content):
+            if first_run:
+                line_nr = 0
+                for line in file_content:
+                    line_nr = line_nr + 1
+                    if len(line) - 1 > self.length:
+                        super().reportError(file_name, line_nr, len(line) - 1, "{} > {}".format(len(line) - 1, self.length))
+
+    class NameChecker(Checker):
+        types = ["file", "function", "variable", "define", "enum"]
+        scopes = ["global", "local"]
+
+        def __init__(self, rule):
+            super().__init__(rule)
+            self.parser = re.compile(rule["args"]["regex"])
+            self.type = rule["args"]["type"]
+            self.scope = rule["args"]["scope"]
+            if not self.type in self.types:
+                print("invalid name type: {}".format(self.type))
+            if not self.scope in self.scopes:
+                print("invalid name scope: {}".format(self.scope))
+
+        def run(self, first_run, cfg, raw_tokens, file_name, file_content):
+            if self.type == "file":
+                if first_run:
+                    if not self.parser.match(os.path.basename(file_name)):
+                        super().reportError(file_name, 0, 0, "")
+
+            elif self.type == "function":
+                for fct in cfg.functions:
+                    if (self.scope == "local" and fct.isStatic) or (self.scope == "global" and not fct.isStatic):
+                        if not self.parser.match(fct.name):
+                            super().reportError_fromToken(fct.tokenDef, fct.name)
+
+            elif self.type == "variable":
+                for var in cfg.variables:
+                    if (self.scope == "local" and var.isStatic) or (self.scope == "global" and var.isGlobal):
+                        if not self.parser.match(var.nameToken.str):
+                            super().reportError_fromToken(var.tokenDef, var.nameToken.str)
+
+            elif self.type == "define":
+                for directive in cfg.directives:
+                    res = re.search(r'#define ([^ ]+)', directive.str)
+                    if res:
+                        extension = directive.file.split(".")[-1]
+                        if (self.scope == "local" and extension == "c") or (self.scope == "global" and extension == "h"):
+                            if not self.parser.match(res.group(1)):
+                                super().reportError_fromToken(directive, res.group(1))
+
+            elif self.type == "enum":
+                for scope in cfg.scopes:
+                    if scope.type == "Enum":
+                        extension = scope.bodyStart.file.split(".")[-1]
+                        if (self.scope == "local" and extension == "c") or (self.scope == "global" and extension == "h"):
+                            token = scope.bodyStart
+
+                            while token and token != scope.bodyEnd:
+                                if token.isName:
+                                    if not self.parser.match(token.str):
+                                        super().reportError_fromToken(token, token.str)
+                                token = token.next
 
     def __init__(self, args):
         self.checker_list = []
@@ -69,6 +134,10 @@ class StyleChecker:
             for rule in data["rules"]:
                 if rule["tool"] == "lineBlacklist":
                     self.checker_list.append(self.LineBlacklist(rule))
+                elif rule["tool"] == "lineLength":
+                    self.checker_list.append(self.LineLength(rule))
+                elif rule["tool"] == "nameChecker":
+                    self.checker_list.append(self.NameChecker(rule))
                 #else :
                     #print("Warning: Unknown tool: {}".format(rule["tool"]))
 
@@ -77,7 +146,7 @@ class StyleChecker:
         sourceFileName = data.rawTokens[0].file
 
         with open(sourceFileName, 'r') as file:
-            sourceFile = file.readlines();
+            sourceFile = file.readlines()
 
         first_run = True
 
